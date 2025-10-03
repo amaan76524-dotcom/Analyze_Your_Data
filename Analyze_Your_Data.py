@@ -6,15 +6,13 @@ import sqlite3
 from datetime import datetime
 import re
 
-# ---------- CONFIG ----------
 DB_FILE = "orders.db"
 SNAPSHOT_FILE = "orders_snapshot.csv"
 
-# ---------- DB init + schema-migration ----------
 EXPECTED_COLUMNS = [
-    "purchase_order_no","invoice_no","order_date","invoice_date","customer","address",
-    "product","hsn","sku","size","color","qty","gross_amount","total_amount",
-    "payment_type","courier","added_at"
+    "purchase_order_no","order_date","customer","address",
+    "product","hsn","sku","size","color","qty",
+    "gross_amount","total_amount","payment_type","courier","added_at"
 ]
 
 def init_db():
@@ -22,7 +20,6 @@ def init_db():
     c = conn.cursor()
     c.execute('CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT)')
     conn.commit()
-    # schema migration
     c.execute("PRAGMA table_info(orders)")
     existing = [row[1] for row in c.fetchall()]
     for col in EXPECTED_COLUMNS:
@@ -35,7 +32,7 @@ conn, c = init_db()
 
 st.title("📦 FineFaser Order Tracker")
 
-# ---------- Helpers ----------
+# -------- Helpers --------
 def clean_amt(s):
     return s.replace("Rs.","").replace("Rs","").replace(",","").strip() if s else s
 
@@ -56,7 +53,7 @@ def extract_courier(text):
 def extract_from_text(text):
     res = {}
 
-    # Payment type and courier
+    # Payment & Courier
     res['payment_type'] = extract_payment_type(text)
     res['courier'] = extract_courier(text)
 
@@ -80,18 +77,20 @@ def extract_from_text(text):
                 addr_lines.append(line)
             res['address'] = " ".join(addr_lines).strip()
 
-    # Purchase Order, Invoice, Dates
+    # Purchase Order No
     m_po = re.search(r"Purchase Order No\.\s*([0-9]+)", text)
-    if m_po: res['purchase_order_no'] = m_po.group(1)
+    if m_po: 
+        res['purchase_order_no'] = m_po.group(1)
 
-    m_inv = re.search(r"Invoice No\.\s*([^\s\n]+)", text)
-    if m_inv: res['invoice_no'] = m_inv.group(1)
-
-    m_od = re.search(r"Order Date\s*([0-9./-]+)", text)
-    if m_od: res['order_date'] = m_od.group(1)
-
-    m_id = re.search(r"Invoice Date\s*([0-9./-]+)", text)
-    if m_id: res['invoice_date'] = m_id.group(1)
+    # Order Date
+    m_od = re.search(r"Order Date\s*[:\-]?\s*([0-9./-]+)", text, flags=re.I)
+    if m_od:
+        res['order_date'] = m_od.group(1)
+    else:
+        # fallback: any date pattern
+        m_any = re.search(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{4}\b", text)
+        if m_any:
+            res['order_date'] = m_any.group(0)
 
     # SKU / Size / Color
     if "SKU Size Qty Color Order No." in text:
@@ -133,7 +132,7 @@ def extract_from_text(text):
 
     return res
 
-# ---------- Upload + Extract ----------
+# -------- Upload + Extract --------
 uploaded_file = st.file_uploader("Upload Meesho Label (PDF)", type=["pdf"])
 
 if uploaded_file:
@@ -151,17 +150,10 @@ if uploaded_file:
     st.json(fields)
 
     try:
-        c.execute('''
-            INSERT INTO orders (purchase_order_no, invoice_no, order_date, invoice_date,
-                                customer, address, product, hsn, sku, size, color, qty,
-                                gross_amount, total_amount, payment_type, courier, added_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            fields["purchase_order_no"], fields["invoice_no"], fields["order_date"], fields["invoice_date"],
-            fields["customer"], fields["address"], fields["product"], fields["hsn"], fields["sku"],
-            fields["size"], fields["color"], fields["qty"], fields["gross_amount"],
-            fields["total_amount"], fields["payment_type"], fields["courier"], fields["added_at"]
-        ))
+        c.execute(f'''
+            INSERT INTO orders ({",".join(EXPECTED_COLUMNS)})
+            VALUES ({",".join("?"*len(EXPECTED_COLUMNS))})
+        ''', tuple(fields[col] for col in EXPECTED_COLUMNS))
         conn.commit()
         st.success("✅ Order saved to database")
     except Exception as e:
@@ -173,10 +165,11 @@ if uploaded_file:
     st.download_button("⬇️ Download All Orders (CSV)", data=df.to_csv(index=False),
                        file_name=SNAPSHOT_FILE, mime="text/csv")
 
-# ---------- Display Orders ----------
+# -------- Display Orders --------
 st.subheader("📊 All Saved Orders")
 df_all = pd.read_sql_query("SELECT * FROM orders ORDER BY id DESC", conn)
 st.dataframe(df_all)
+
 
 
 
