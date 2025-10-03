@@ -22,8 +22,8 @@ def init_db():
         invoice_no TEXT,
         order_date TEXT,
         invoice_date TEXT,
-        customer TEXT,
-        address TEXT,
+        customer_address TEXT,
+    
         product TEXT,
         hsn TEXT,
         sku TEXT,
@@ -131,8 +131,8 @@ if uploaded_file:
     fields['added_at'] = datetime.utcnow().isoformat()
 
     # Normalize keys
-    for k in ["purchase_order_no","invoice_no","order_date","invoice_date","customer",
-              "address","product","hsn","sku","size","color","qty","gross_amount","total_amount"]:
+    for k in ["purchase_order_no","invoice_no","order_date","invoice_date","customer_address"
+              ,"product","hsn","sku","size","color","qty","gross_amount","total_amount"]:
         fields.setdefault(k,"NA")
 
     st.subheader("Extracted Order Data")
@@ -141,12 +141,12 @@ if uploaded_file:
     # Insert into DB
     c.execute('''
         INSERT INTO orders (purchase_order_no, invoice_no, order_date, invoice_date,
-                            customer, address, product, hsn, sku, size, color, qty,
+                            customer_address, product, hsn, sku, size, color, qty,
                             gross_amount, total_amount, added_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         fields["purchase_order_no"], fields["invoice_no"], fields["order_date"], fields["invoice_date"],
-        fields["customer"], fields["address"], fields["product"], fields["hsn"], fields["sku"],
+        fields["customer_address"], fields["product"], fields["hsn"], fields["sku"],
         fields["size"], fields["color"], fields["qty"], fields["gross_amount"],
         fields["total_amount"], fields["added_at"]
     ))
@@ -167,6 +167,7 @@ if uploaded_file:
 st.subheader("📊 All Saved Orders")
 df_all = pd.read_sql_query("SELECT * FROM orders ORDER BY id DESC", conn)
 st.dataframe(df_all)
+
 
 
 
