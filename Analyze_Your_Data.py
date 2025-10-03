@@ -5,10 +5,19 @@ import pdfplumber
 import sqlite3
 import os
 import re
+import tempfile
 from datetime import datetime
-from github import Github
 
-# Files
+# OCR libs
+try:
+    import pytesseract
+    from pdf2image import convert_from_path
+    from PIL import Image
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
+
+# ---------- CONFIG ----------
 DB_FILE = "orders.db"
 SNAPSHOT_FILE = "orders_snapshot.csv"
 
@@ -20,10 +29,14 @@ CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_no TEXT,
     invoice_no TEXT,
+    purchase_order_no TEXT,
     order_date TEXT,
+    invoice_date TEXT,
     customer TEXT,
     address TEXT,
     product TEXT,
+    hsn TEXT,
+    sku TEXT,
     qty TEXT,
     gross_amount TEXT,
     total_amount TEXT,
@@ -32,144 +45,203 @@ CREATE TABLE IF NOT EXISTS orders (
 ''')
 conn.commit()
 
-st.title("📦 FineFaser Order Tracker")
+st.title("📦 FineFaser — Improved Order Extractor")
 
-# ---------- helpers ----------
-def extract_text_from_pdf(uploaded_file):
-    text = ""
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
+st.markdown("Upload a Meesho label (PDF). App will try text-extraction first and fall back to OCR if needed.")
 
-def re_search(pattern, text, default="NA", flags=re.I):
-    m = re.search(pattern, text, flags)
-    return m.group(1).strip() if m else default
+# ---------- Helpers ----------
+def clean_amt(s):
+    return s.replace("Rs.","").replace("Rs","").replace(",","").strip() if s else s
 
-def extract_order_fields(text):
-    # robust-ish regex extractions with fallbacks
-    order_no = re_search(r"Order\s*No\.?\s*[:\-]?\s*([^\n\r]+)", text)
-    invoice_no = re_search(r"Invoice\s*No\.?\s*[:\-]?\s*([^\n\r]+)", text)
-    order_date = re_search(r"Order\s*Date[:\-]?\s*([^\n\r]+)", text)
-
-    # customer / address block
-    customer = "NA"
-    address = "NA"
+def extract_from_text(text):
+    """Robust heuristics to parse the common fields from text."""
+    res = {}
+    # CUSTOMER block
     if "Customer Address" in text:
-        try:
-            block = text.split("Customer Address",1)[1].split("If undelivered",1)[0]
-            lines = [l.strip() for l in block.splitlines() if l.strip()]
-            if lines:
-                customer = lines[0]
-                address = " ".join(lines)
-        except:
-            pass
+        after = text.split("Customer Address",1)[1]
+        lines = [l.strip() for l in after.splitlines() if l.strip()]
+        # pick first likely name (skip COD lines)
+        name = None
+        for line in lines:
+            if line.upper().startswith("COD"): continue
+            if line.lower().startswith("delhivery"): continue
+            if line.lower().startswith("pickup"): continue
+            if re.search(r"[A-Za-z]", line) and len(line.split()) <= 6:
+                name = line
+                break
+        res['customer'] = name or (lines[0] if lines else "NA")
+        # address: lines until 'If undelivered' or 'Pickup'
+        addr_lines = []
+        for line in lines:
+            low = line.lower()
+            if low.startswith("if undelivered") or low.startswith("pickup"):
+                break
+            addr_lines.append(line)
+        # remove leading COD if present
+        if addr_lines and addr_lines[0].upper().startswith("COD"):
+            addr_lines = addr_lines[1:]
+        # avoid repeating customer in address:
+        if addr_lines and res['customer'] and addr_lines[0].strip() == res['customer'].strip():
+            addr_lines = addr_lines[1:]
+        res['address'] = " ".join(addr_lines).strip() if addr_lines else "NA"
 
-    # product: try to find line after 'Description'
-    product = "NA"
-    qty = "NA"
+    # PURCHASE / INVOICE / DATES: often in a header line then numeric line
+    parts = text.splitlines()
+    for i, line in enumerate(parts):
+        if re.search(r"Purchase Order No", line, re.I) and re.search(r"Invoice No", line, re.I):
+            if i + 1 < len(parts):
+                vals = parts[i+1].split()
+                # Expect: <purchase_order> <invoice_no> <order_date> <invoice_date>
+                if len(vals) >= 4:
+                    res['purchase_order_no'] = vals[0]
+                    res['invoice_no'] = vals[1]
+                    res['order_date'] = vals[2]
+                    res['invoice_date'] = vals[3]
+            break
+    if 'purchase_order_no' not in res:
+        m = re.search(r"\b(\d{15,18})\b", text)
+        if m: res['purchase_order_no'] = m.group(1)
+
+    # PRODUCT area: find "Description" then find the HSN / qty / Rs pattern
     if "Description" in text:
+        rest = text.split("Description", 1)[1]
+        lines = [l.strip() for l in rest.splitlines() if l.strip()]
+        pattern = re.compile(r"(\d{5,6})\s+(\d+)\s+Rs\.?\s*([0-9\.,]+)")
+        matched = False
+        for idx, line in enumerate(lines):
+            m = pattern.search(line)
+            if m:
+                hsn, qty, gross = m.groups()
+                res['hsn'] = hsn
+                res['qty'] = qty
+                res['gross_amount'] = clean_amt(gross)
+                # product often on same or previous line
+                prod_name = line[:m.start()].strip()
+                if len(prod_name) < 3 and idx > 0:
+                    prod_name = lines[idx - 1].strip()
+                res['product'] = prod_name
+                matched = True
+                break
+        if not matched:
+            # fallback minimal product detection
+            for line in lines:
+                if re.search(r"HSN", line, re.I) and re.search(r"Qty", line, re.I): continue
+                if re.search(r"[A-Za-z]", line):
+                    res['product'] = line
+                    break
+            mqty = re.search(r"\bQty[:\s]*([0-9]+)\b", text)
+            if mqty and 'qty' not in res: res['qty'] = mqty.group(1)
+            mg = re.search(r"Gross Amount[:\s]*Rs\.?\s*([0-9\.,]+)", text)
+            if mg and 'gross_amount' not in res: res['gross_amount'] = clean_amt(mg.group(1))
+
+    # TOTAL: last Rs.<num>
+    all_rs = re.findall(r"Rs\.?\s*([0-9\.,]+)", text)
+    if all_rs:
+        res['total_amount'] = clean_amt(all_rs[-1])
+
+    # SKU (optional)
+    msku = re.search(r"SKU\s+Size\s+Qty\s+Color\s+Order No\.\s*(.+)", text, re.I)
+    if msku:
+        res['sku'] = msku.group(1).strip()
+
+    return res
+
+def pdf_to_text_bytesio(uploaded_file, poppler_path=None, force_ocr=False):
+    """Try pdfplumber first; if empty or force_ocr -> use pdf2image + pytesseract."""
+    # pdfplumber on BytesIO
+    text = ""
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                ptext = page.extract_text()
+                if ptext:
+                    text += "\n" + ptext
+    except Exception:
+        text = ""
+
+    # If text is short or user forces OCR, use OCR
+    if force_ocr or (len(text.strip()) < 200):
+        if not OCR_AVAILABLE:
+            return text, False, "OCR libs not installed"
+        # write bytes to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_file.getbuffer())
+            tmp_path = tmp.name
         try:
-            rest = text.split("Description",1)[1]
-            lines = [l.strip() for l in rest.splitlines() if l.strip()]
-            if lines:
-                product = lines[0]
-        except:
-            pass
-    # qty common pattern
-    qty = re_search(r"\bQty[:\s]*([0-9]+)", text, default="NA")
+            images = convert_from_path(tmp_path, dpi=300, poppler_path=poppler_path) if poppler_path else convert_from_path(tmp_path, dpi=300)
+            ocr_text = ""
+            for im in images:
+                ocr_text += pytesseract.image_to_string(im, lang='eng') + "\n"
+        finally:
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+        return ocr_text, True, "ocr_used"
+    return text, False, "plumber"
 
-    # amounts
-    gross_amount = re_search(r"Gross\s*Amount[:\s]*Rs\.?\s*([0-9\.,]+)", text, default="NA")
-    # fallback: find first Rs.<num> after product line
-    if gross_amount == "NA":
-        m = re.search(r"Rs\.?\s*([0-9\.,]+)", text)
-        if m: gross_amount = m.group(1)
-
-    total_amount = re_search(r"Total(?:\s+Rs\.?)?\s*[:\s]*Rs?\.?\s*([0-9\.,]+)", text, default="NA")
-    # fallback to last Rs.<num>
-    if total_amount == "NA":
-        all_rs = re.findall(r"Rs\.?\s*([0-9\.,]+)", text)
-        if all_rs:
-            total_amount = all_rs[-1]
-
-    return {
-        "order_no": order_no,
-        "invoice_no": invoice_no,
-        "order_date": order_date,
-        "customer": customer,
-        "address": address,
-        "product": product,
-        "qty": qty,
-        "gross_amount": gross_amount,
-        "total_amount": total_amount
-    }
-
-# ---------- file upload & extract ----------
+# ---------- UI ----------
 uploaded_file = st.file_uploader("Upload Meesho Label (PDF)", type=["pdf"])
+force_ocr = st.checkbox("Force OCR (useful for scanned labels)", value=False)
+show_raw = st.checkbox("Show raw extracted text (debug)", value=False)
+
+# Allow user to provide poppler / tesseract paths via Streamlit secrets (useful on Windows)
+poppler_path = st.secrets.get("POPPLER_PATH") if "POPPLER_PATH" in st.secrets else None
+tesseract_cmd = st.secrets.get("TESSERACT_CMD") if "TESSERACT_CMD" in st.secrets else None
+if tesseract_cmd and OCR_AVAILABLE:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
 if uploaded_file:
-    with st.spinner("Extracting text..."):
-        text = extract_text_from_pdf(uploaded_file)
+    with st.spinner("Extracting..."):
+        text, used_ocr, msg = pdf_to_text_bytesio(uploaded_file, poppler_path=poppler_path, force_ocr=force_ocr)
+    if show_raw:
+        st.subheader("Raw extracted text")
+        st.text_area("Raw text", value=text, height=300)
 
-    fields = extract_order_fields(text)
-    fields["added_at"] = datetime.utcnow().isoformat()
+    fields = extract_from_text(text)
+    fields['added_at'] = datetime.utcnow().isoformat()
+    # quick normalization for missing keys
+    for k in ["purchase_order_no","invoice_no","order_date","invoice_date","customer","address","product","qty","gross_amount","total_amount","hsn","sku"]:
+        fields.setdefault(k,"NA")
 
-    # show preview to user
-    st.subheader("Extracted fields")
+    st.subheader("Parsed fields")
     st.json(fields)
 
-    # insert into sqlite
+    # Insert to DB
     try:
         c.execute('''
-            INSERT INTO orders (order_no, invoice_no, order_date, customer, address, product, qty, gross_amount, total_amount, added_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO orders (order_no, invoice_no, purchase_order_no, order_date, invoice_date, customer, address, product, hsn, sku, qty, gross_amount, total_amount, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            fields["order_no"], fields["invoice_no"], fields["order_date"], fields["customer"],
-            fields["address"], fields["product"], fields["qty"], fields["gross_amount"], fields["total_amount"], fields["added_at"]
+            fields.get("order_no","NA"),
+            fields.get("invoice_no","NA"),
+            fields.get("purchase_order_no","NA"),
+            fields.get("order_date","NA"),
+            fields.get("invoice_date","NA"),
+            fields.get("customer","NA"),
+            fields.get("address","NA"),
+            fields.get("product","NA"),
+            fields.get("hsn","NA"),
+            fields.get("sku","NA"),
+            fields.get("qty","NA"),
+            fields.get("gross_amount","NA"),
+            fields.get("total_amount","NA"),
+            fields.get("added_at")
         ))
         conn.commit()
-        st.success("✅ Order saved to local DB (orders.db)")
+        st.success("✅ Order saved to local DB")
     except Exception as e:
         st.error(f"DB insert failed: {e}")
 
-    # export snapshot CSV
+    # snapshot to CSV
     df = pd.read_sql_query("SELECT * FROM orders ORDER BY id DESC", conn)
     df.to_csv(SNAPSHOT_FILE, index=False)
-    st.info(f"Snapshot exported to {SNAPSHOT_FILE}")
+    st.info(f"Snapshot saved to {SNAPSHOT_FILE}")
 
-    # try to push snapshot to GitHub if secrets are configured
-    github_token = st.secrets.get("GITHUB_TOKEN") if "GITHUB_TOKEN" in st.secrets else None
-    github_repo = st.secrets.get("GITHUB_REPO") if "GITHUB_REPO" in st.secrets else None
-    github_path = st.secrets.get("GITHUB_FILE_PATH") if "GITHUB_FILE_PATH" in st.secrets else SNAPSHOT_FILE
+    # Download button
+    st.download_button("⬇️ Download snapshot CSV", data=df.to_csv(index=False), file_name=SNAPSHOT_FILE, mime="text/csv")
 
-    if github_token and github_repo:
-        try:
-            g = Github(github_token)
-            repo = g.get_repo(github_repo)  # format: "username/repo"
-            content = open(SNAPSHOT_FILE, "r", encoding="utf-8").read()
-            try:
-                existing = repo.get_contents(github_path)
-                repo.update_file(existing.path,
-                                 f"Update orders snapshot {datetime.utcnow().isoformat()}",
-                                 content,
-                                 existing.sha)
-                st.success("✅ Snapshot updated on GitHub.")
-            except Exception:
-                # file missing -> create
-                repo.create_file(github_path,
-                                 f"Add orders snapshot {datetime.utcnow().isoformat()}",
-                                 content)
-                st.success("✅ Snapshot created on GitHub.")
-        except Exception as e:
-            st.error(f"Failed to push to GitHub: {e}")
-    else:
-        st.info("GitHub token/repo not configured. Snapshot not pushed to GitHub.")
-
-# ---------- show all orders ----------
-st.subheader("📊 All Orders (local snapshot)")
+st.subheader("All saved orders (local DB)")
 df_all = pd.read_sql_query("SELECT * FROM orders ORDER BY id DESC", conn)
 st.dataframe(df_all)
 
-st.download_button("⬇️ Download snapshot CSV", data=df_all.to_csv(index=False), file_name=SNAPSHOT_FILE, mime="text/csv")
