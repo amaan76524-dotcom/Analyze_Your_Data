@@ -4,6 +4,7 @@ import pandas as pd
 import pdfplumber
 import sqlite3
 from datetime import datetime
+import os
 import re
 
 # ---------- CONFIG ----------
@@ -24,9 +25,6 @@ CREATE TABLE IF NOT EXISTS orders (
     address TEXT,
     product TEXT,
     hsn TEXT,
-    sku TEXT,
-    size TEXT,
-    color TEXT,
     qty TEXT,
     gross_amount TEXT,
     total_amount TEXT,
@@ -35,7 +33,7 @@ CREATE TABLE IF NOT EXISTS orders (
 ''')
 conn.commit()
 
-st.title("📦 FineFaser Order Tracker (Cloud-Safe + SKU/Size/Color)")
+st.title("📦 FineFaser Order Tracker (Cloud-Safe)")
 
 # ---------- Helpers ----------
 def clean_amt(s):
@@ -69,16 +67,6 @@ def extract_from_text(text):
     m_id = re.search(r"Invoice Date\s*([0-9./-]+)", text)
     if m_id: res['invoice_date'] = m_id.group(1)
 
-    # Product Details (SKU / Size / Qty / Color / Order No.)
-    if "SKU Size Qty Color Order No." in text:
-        block = text.split("SKU Size Qty Color Order No.")[1].split("\n")[1].strip()
-        parts = block.split()
-        if len(parts) >= 4:
-            res['sku'] = parts[0]
-            res['size'] = parts[1] + ((" " + parts[2]) if parts[1].lower() == "free" and parts[2].lower() == "size" else "")
-            res['qty'] = parts[2] if res.get('size') != "Free Size" else parts[3]
-            res['color'] = parts[3] if res.get('size') != "Free Size" else parts[4]
-
     # Product / HSN / Qty / Gross Amount
     if "Description" in text:
         rest = text.split("Description",1)[1]
@@ -87,7 +75,7 @@ def extract_from_text(text):
             m = re.search(r"(\d{5,6})\s+(\d+)\s+Rs\.?\s*([0-9\.,]+)", line)
             if m:
                 res['hsn'] = m.group(1)
-                res['qty'] = res.get('qty', m.group(2))
+                res['qty'] = m.group(2)
                 res['gross_amount'] = clean_amt(m.group(3))
                 res['product'] = line[:m.start()].strip()
                 break
@@ -114,8 +102,7 @@ if uploaded_file:
     fields['added_at'] = datetime.utcnow().isoformat()
 
     # Normalize keys
-    for k in ["purchase_order_no","invoice_no","order_date","invoice_date","customer",
-              "address","product","hsn","sku","size","color","qty","gross_amount","total_amount"]:
+    for k in ["purchase_order_no","invoice_no","order_date","invoice_date","customer","address","product","hsn","qty","gross_amount","total_amount"]:
         fields.setdefault(k,"NA")
 
     st.subheader("Extracted Order Data")
@@ -124,14 +111,12 @@ if uploaded_file:
     # Insert into DB
     c.execute('''
         INSERT INTO orders (purchase_order_no, invoice_no, order_date, invoice_date,
-                            customer, address, product, hsn, sku, size, color, qty,
-                            gross_amount, total_amount, added_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            customer, address, product, hsn, qty, gross_amount, total_amount, added_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         fields["purchase_order_no"], fields["invoice_no"], fields["order_date"], fields["invoice_date"],
-        fields["customer"], fields["address"], fields["product"], fields["hsn"], fields["sku"],
-        fields["size"], fields["color"], fields["qty"], fields["gross_amount"],
-        fields["total_amount"], fields["added_at"]
+        fields["customer"], fields["address"], fields["product"], fields["hsn"], fields["qty"],
+        fields["gross_amount"], fields["total_amount"], fields["added_at"]
     ))
     conn.commit()
     st.success("✅ Order saved to database")
@@ -150,6 +135,8 @@ if uploaded_file:
 st.subheader("📊 All Saved Orders")
 df_all = pd.read_sql_query("SELECT * FROM orders ORDER BY id DESC", conn)
 st.dataframe(df_all)
+
+
 
 
 
