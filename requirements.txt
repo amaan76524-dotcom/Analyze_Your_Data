@@ -2,3 +2,7 @@ streamlit
 pandas
 pdfplumber
 PyGithub
+pytesseract
+pdf2image
+Pillow
+
