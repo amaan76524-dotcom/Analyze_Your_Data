@@ -10,7 +10,8 @@ DB_FILE = "orders.db"
 SNAPSHOT_FILE = "orders_snapshot.csv"
 
 EXPECTED_COLUMNS = [
-    "purchase_order_no","order_date","customer","address",
+    "purchase_order_no","order_date",
+    "customer_address","bill_to_address",
     "product","hsn","qty","gross_amount","total_amount","added_at"
 ]
 
@@ -20,7 +21,6 @@ def init_db():
     c = conn.cursor()
     c.execute('CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT)')
     conn.commit()
-    # add missing columns if needed
     c.execute("PRAGMA table_info(orders)")
     existing = [row[1] for row in c.fetchall()]
     for col in EXPECTED_COLUMNS:
@@ -31,53 +31,70 @@ def init_db():
 
 conn, c = init_db()
 
-st.title("📦 FineFaser Order Tracker (Minimal)")
+st.title("📦 FineFaser Order Tracker (Dual Address Version)")
 
 # ---------- Helpers ----------
 def clean_amt(s):
     return s.replace("Rs.","").replace("Rs","").replace(",","").strip() if s else s
 
+def extract_block(lines, start_kw, end_kws):
+    """Extract text block between start keyword and any of the end keywords."""
+    content = []
+    capture = False
+    for line in lines:
+        if start_kw.lower() in line.lower():
+            capture = True
+            continue
+        if capture:
+            if any(end_kw.lower() in line.lower() for end_kw in end_kws):
+                break
+            content.append(line)
+    return content
+
 def extract_from_text(text):
     res = {k: "NA" for k in EXPECTED_COLUMNS}
-
-    # Normalize lines
     lines = [re.sub(r'\s+', ' ', l).strip() for l in text.splitlines() if l.strip()]
 
+    # ---------- CUSTOMER ADDRESS ----------
+    cust_block = extract_block(lines, "Customer Address", ["Pickup", "Product Details", "If undelivered"])
+    if cust_block:
+        res["customer_address"] = " ".join(cust_block).strip()
+
+    # ---------- BILL TO / SHIP TO ----------
+    bill_block = extract_block(lines, "BILL TO / SHIP TO", ["Purchase Order No", "Description", "Product Details"])
+    if bill_block:
+        res["bill_to_address"] = " ".join(bill_block).strip()
+
+    # ---------- PURCHASE ORDER NUMBER ----------
     for line in lines:
-        # Purchase Order No
-        if line.startswith("Purchase Order No"):
-            m = re.search(r"(\d{12,20})", line)
-            if m: res['purchase_order_no'] = m.group(1)
-
-        # Order Date
-        elif line.startswith("Order Date"):
-            m = re.search(r"(\d{1,2}[./-]\d{1,2}[./-]\d{4})", line)
-            if m: res['order_date'] = m.group(1)
-
-        # Customer & Address block
-        elif line.startswith("Customer Address"):
-            idx = lines.index(line) + 1
-            cust_lines = []
-            while idx < len(lines) and not any(x in lines[idx] for x in ["If undelivered","Sold by","Description"]):
-                cust_lines.append(lines[idx])
-                idx += 1
-            if cust_lines:
-                res['customer'] = cust_lines[0]
-                res['address'] = " ".join(cust_lines)
-
-        # Product + HSN + Qty + Gross
-        elif re.search(r"\d{5,6}\s+\d+\s+Rs", line):
-            m = re.search(r"(.+?)\s+(\d{5,6})\s+(\d+)\s+Rs\.?\s*([\d\.,]+)", line)
+        if "Purchase Order No" in line:
+            m = re.search(r"\b(\d{12,20})\b", line)
             if m:
-                res['product'] = m.group(1).strip()
-                res['hsn'] = m.group(2)
-                res['qty'] = m.group(3)
-                res['gross_amount'] = clean_amt(m.group(4))
+                res["purchase_order_no"] = m.group(1)
 
-    # Total Amount (last Rs value in doc)
+    # ---------- ORDER DATE ----------
+    for line in lines:
+        if "Order Date" in line:
+            m = re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{4}", line)
+            if m:
+                res["order_date"] = m.group(0)
+                break
+
+    # ---------- PRODUCT + HSN + QTY + AMOUNT ----------
+    desc_section = extract_block(lines, "Description", ["Tax is not payable", "Total", "This is a computer"])
+    for line in desc_section:
+        m = re.search(r"(.+?)\s+(\d{5,6})\s+(\d+)\s+Rs\.?\s*([\d\.,]+)", line)
+        if m:
+            res["product"] = m.group(1).strip()
+            res["hsn"] = m.group(2)
+            res["qty"] = m.group(3)
+            res["gross_amount"] = clean_amt(m.group(4))
+            break
+
+    # ---------- TOTAL AMOUNT ----------
     all_rs = re.findall(r"Rs\.?\s*([\d\.,]+)", text)
     if all_rs:
-        res['total_amount'] = clean_amt(all_rs[-1])
+        res["total_amount"] = clean_amt(all_rs[-1])
 
     return res
 
@@ -93,12 +110,12 @@ if uploaded_file:
                 text += "\n" + t
 
     fields = extract_from_text(text)
-    fields['added_at'] = datetime.utcnow().isoformat()
+    fields["added_at"] = datetime.utcnow().isoformat()
 
     st.subheader("✅ Extracted Order Data")
     st.json(fields)
 
-    # Save to DB
+    # ---------- Save ----------
     try:
         c.execute(f'''
             INSERT INTO orders ({",".join(EXPECTED_COLUMNS)})
@@ -109,17 +126,20 @@ if uploaded_file:
     except Exception as e:
         st.error(f"DB insert failed: {e}")
 
-    # Export CSV
+    # ---------- CSV Download ----------
     df = pd.read_sql_query("SELECT * FROM orders ORDER BY id DESC", conn)
     df.to_csv(SNAPSHOT_FILE, index=False)
+    st.download_button("⬇️ Download Orders (CSV)",
+                       data=df.to_csv(index=False),
+                       file_name=SNAPSHOT_FILE,
+                       mime="text/csv")
 
-    st.download_button("⬇️ Download Orders (CSV)", data=df.to_csv(index=False),
-                       file_name=SNAPSHOT_FILE, mime="text/csv")
-
-# ---------- Display All Orders ----------
+# ---------- Display ----------
 st.subheader("📊 All Saved Orders")
 df_all = pd.read_sql_query("SELECT * FROM orders ORDER BY id DESC", conn)
 st.dataframe(df_all)
+
+
 
 
 
